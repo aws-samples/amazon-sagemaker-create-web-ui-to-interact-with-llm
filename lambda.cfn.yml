@@ -1,0 +1,310 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Part 2. Deploy Lambda and IAM permissions"
+Parameters:
+  PexelsApiKey:
+    Type: String
+    Description: Pexels API Key for the Lambda function
+Resources:
+  LambdaCallSagemakerEndpoints:
+    Type: "AWS::Lambda::Function"
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_116
+            comment: DLQ not needed for this Lambda for this use case
+          - id: CKV_AWS_173
+            comment: Encryption not required for this Lambda for this use case
+          - id: CKV_AWS_115
+            comment: Function-level concurrent execution limit not required for this use case
+          - id: CKV_AWS_117
+            comment: Lambda deployed in VPC is not required for this use case
+    Properties:
+      Description: "Function which calls a Sagemaker endpoint to return response from LLM + Pexels photo/video URLs"
+      Environment:
+        Variables:
+          PEXELS_KEY: !Ref PexelsApiKey
+      FunctionName: "callSagemakerEndpoints"
+      Handler: "index.lambda_handler"
+      Architectures:
+        - "x86_64"
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import urllib3
+
+
+          runtime = boto3.client("runtime.sagemaker")
+
+          def lambda_handler(event, context):
+              print("Received event: " + json.dumps(event))
+
+              if "body" in event:
+                  # called via function URL
+                  body = json.loads(event["body"])
+              else:
+                  # called via test
+                  body = event
+
+              endpoint_name = body["endpoint_name"]
+              payload = body["payload"]
+              user_query = payload["text_inputs"]
+
+              # Check if user requested for images
+              with_images = False
+              if "llama" in endpoint_name and "with images" in payload["text_inputs"][0][-1]["content"]:
+                  print("payload[text_inputs][0]", payload["text_inputs"][0])
+                  l = []
+                  for text_input in payload["text_inputs"][0]:
+                      print("text_input", text_input)
+                      cleaned_text_input = text_input
+                      cleaned_text_input["content"] = cleaned_text_input["content"].replace("with images", "")
+                      l.append(cleaned_text_input)
+                  payload["text_inputs"] = [l]
+                  with_images = True
+              elif "with images" in payload["text_inputs"]:
+                  payload["text_inputs"] = payload["text_inputs"].replace("with images", "")
+                  with_images = True
+
+              # Custom handling of input for different models
+              # handle NeoXT
+              if "neoxt" in endpoint_name:
+                  neoxt_custom_input = "<human>: " + payload["text_inputs"] + "\n<bot>:"
+                  payload["text_inputs"] = neoxt_custom_input
+              # handle Falcon
+              elif "falcon" in endpoint_name:
+                  falcon_custom_input = {
+                      "inputs": payload["text_inputs"],
+                      "parameters": {
+                          k: payload[k] for k in set(list(payload.keys())) - {"text_inputs"}
+                      },  # remove 'text_inputs' from params
+                  }
+                  payload = falcon_custom_input
+              # handle Llama2
+              elif "llama" in endpoint_name:
+                  llama_custom_input = {
+                      "inputs": payload["text_inputs"],
+                      "parameters": {
+                          k: payload[k] for k in set(list(payload.keys())) - {"text_inputs"}
+                      },  # remove 'text_inputs' from params
+                  }
+                  payload = llama_custom_input
+              print(payload)
+
+              # call invoke endpoint conditionally
+              # handle Falcon and NeoXT
+              if "neoxt" in endpoint_name or "falcon" in endpoint_name:
+                  response = runtime.invoke_endpoint(
+                      EndpointName=endpoint_name,
+                      ContentType="application/json",
+                      Body=json.dumps(payload).encode("utf-8"),
+                  )
+                  print(response)
+                  model_predictions = json.loads(response["Body"].read())
+                  print(model_predictions)
+              elif "llama" in endpoint_name:
+                  response = runtime.invoke_endpoint(
+                      EndpointName=endpoint_name,
+                      ContentType="application/json",
+                      Body=json.dumps(payload),
+                      CustomAttributes="accept_eula=true",
+                  )
+                  print(response)
+                  response = response["Body"].read().decode("utf8")
+                  model_predictions = json.loads(response)
+                  print(model_predictions)
+
+              # Custom handling of returned output from different models
+              # handle NeoXT
+              if "neoxt" in endpoint_name:
+                  generated_text = model_predictions[0][0]["generated_text"]
+                  generated_text = generated_text.replace(neoxt_custom_input, "").replace(
+                      "\n<human>:", ""
+                  )
+              elif "falcon" in endpoint_name:
+                  generated_text = model_predictions[0]["generated_text"]
+              elif "llama" in endpoint_name:
+                  generated_text = model_predictions[0]["generation"]['content']
+              print(generated_text)
+
+              # Image generation
+              photo_base64s = []
+
+              if with_images:
+                  payload = {
+                    "prompt": generated_text,
+                    "width": 400,
+                    "height": 400,
+                    "num_images_per_prompt": 2,
+                    "num_inference_steps": 50,
+                    "guidance_scale": 7.5,
+                  }
+
+                  # def query_endpoint_with_json_payload(encoded_json):
+                  #     client = boto3.client('runtime.sagemaker')
+                  #     response = client.invoke_endpoint(EndpointName=endpoint_name, ContentType='application/json', Body=encoded_json)
+                  #     return response
+                  
+                  def parse_response_multiple_images(query_response):
+                      response_dict = json.loads(query_response['Body'].read())
+                      return response_dict['generated_images'], response_dict['prompt']
+                  
+                  # query_response = query_endpoint_with_json_payload(json.dumps(payload).encode('utf-8'))
+                  # generated_images, prompt = parse_response_multiple_images(query_response)
+                  # for img in generated_images:
+                  #     display_image(img, prompt)
+                      
+                  img_endpoint_name = 'jumpstart-dft-stable-diffusion-v2-1-base'
+                  query_response = runtime.invoke_endpoint(
+                      EndpointName=img_endpoint_name,
+                      ContentType='application/json',
+                      Body=json.dumps(payload).encode('utf-8'),
+                      Accept='application/json;jpeg',
+                  )
+                  photo_base64s, prompt = parse_response_multiple_images(query_response)
+
+              return {
+                  "statusCode": 200,
+                  # "headers": {
+                  #     "Access-Control-Allow-Headers": "Content-Type, Authorization",
+                  #     "Access-Control-Allow-Origin": "*",
+                  #     "Access-Control-Allow-Methods": "*",
+                  # },
+                  "body": json.dumps(
+                      {
+                          "text": generated_text,
+                          "photo_base64s": photo_base64s,
+                      }
+                  ),
+              }
+
+      MemorySize: 128
+      Role: !GetAtt RoleCallSageMakerLambda.Arn
+      Runtime: "python3.11"
+      Timeout: 180
+      TracingConfig:
+        Mode: "PassThrough"
+      EphemeralStorage:
+        Size: 512
+
+  RoleCallSageMakerLambda:
+    Type: "AWS::IAM::Role"
+    Metadata:
+      cdk_nag:
+        rules_to_suppress:
+          - id: AwsSolutions-IAM4
+            reason: Role needs to allow full access to Comprehend
+    Properties:
+      Path: "/service-role/"
+      RoleName: "callSagemakerEndpoints-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      MaxSessionDuration: 3600
+      ManagedPolicyArns:
+        - !Ref AWSLambdaBasicExecutionRole
+        - !Ref InvokeAllSagemakerEndpointsPolicy
+        - !Ref ComprehendPolicy
+
+  WebAppUsersGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: WebAppUsersGroup
+      ManagedPolicyArns:
+        - !Ref InvokeAllSagemakerEndpointsPolicy
+        - !Ref InvokeAllFunctionsPolicy
+
+  WebAppUser:
+    Type: "AWS::IAM::User"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: APPSEC-IAM-USEEPHEMERALCREDENTIALS-IAMUSER
+            reason: Required for web app credentials
+    Properties:
+      Path: "/"
+      UserName: "functionUrl"
+
+  WebAppUserGroupMembership:
+    Type: AWS::IAM::UserToGroupAddition
+    Properties:
+      GroupName: !Ref WebAppUsersGroup
+      Users:
+        - !Ref WebAppUser
+
+  AWSLambdaBasicExecutionRole:
+    Type: "AWS::IAM::ManagedPolicy"
+    Metadata:
+      cdk_nag:
+        rules_to_suppress:
+          - id: AwsSolutions-IAM5
+            reason: Lambda execution role needs to be able to create its own log group, and create and put log streams
+    Properties:
+      ManagedPolicyName: "AWSLambdaBasicExecutionRole"
+      Path: "/service-role/"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+            Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
+          - Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/callSagemakerEndpoints:*"
+
+  InvokeAllSagemakerEndpointsPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Metadata:
+      cdk_nag:
+        rules_to_suppress:
+          - id: AwsSolutions-IAM5
+            reason: Policy needs to allow all SageMaker Endpoints to be accessible
+    Properties:
+      ManagedPolicyName: "InvokeAllSagemakerEndpointsPolicy"
+      Path: "/"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - sagemaker:InvokeEndpoint
+            Resource: !Sub "arn:${AWS::Partition}:sagemaker:${AWS::Region}:${AWS::AccountId}:*"
+
+  InvokeAllFunctionsPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      ManagedPolicyName: "InvokeAllFunctionsPolicy"
+      Path: "/"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource: !GetAtt LambdaCallSagemakerEndpoints.Arn
+
+  ComprehendPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Metadata:
+      cdk_nag:
+        rules_to_suppress:
+          - id: AwsSolutions-IAM5
+            reason: comprehend:DetectEntities requires "*", not actually tied to a specific resource
+    Properties:
+      ManagedPolicyName: "ComprehendPolicy"
+      Path: "/"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - comprehend:DetectEntities
+            Resource: "*"

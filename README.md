@@ -1,11 +1,6 @@
-## My Project
+## Create a web UI to interact with LLMs using Amazon SageMaker JumpStart
 
-TODO: Fill this README out!
-
-Be sure to:
-
-* Change the title in this README
-* Edit your repository description on GitHub
+This project contains the supporting code for the [Create a web UI to interact with LLMs using Amazon SageMaker JumpStart](https:www.to-add-blog-post-link.com) blog post.
 
 ## Security
 
