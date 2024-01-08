@@ -1,8 +1,0 @@
-{
-  "lambda_function_name": "callSagemakerEndpoints",
-  "request_text_inputs_key": "text_inputs",
-  "request_payload_key": "payload",
-  "response_strings_to_remove": ["<human>:", "<bot>:"],
-  "human_profile_name": "user",
-  "bot_profile_name": "assistant"
-}
