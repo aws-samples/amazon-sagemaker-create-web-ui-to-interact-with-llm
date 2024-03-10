@@ -1,6 +1,6 @@
 ## Create a web UI to interact with LLMs using Amazon SageMaker JumpStart
 
-This project contains the supporting code for the [Create a web UI to interact with LLMs using Amazon SageMaker JumpStart](https:www.to-add-blog-post-link.com) blog post.
+This project contains the supporting code for the [Create a web UI to interact with LLMs using Amazon SageMaker JumpStart](https://aws.amazon.com/blogs/machine-learning/create-a-web-ui-to-interact-with-llms-using-amazon-sagemaker-jumpstart/) blog post.
 
 ## Security
 
